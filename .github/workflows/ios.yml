@@ -1,0 +1,172 @@
+# Builds Wardrobe for iPhone and iPad (.ipa, unsigned: SideStore signs it with
+# your own Apple ID when it installs it) and adds it to that version's release
+# here, with the SideStore source (source.json) beside it.
+#
+# It runs here, in this public repository, because GitHub doesn't count a
+# public repository's Actions minutes; the app's code stays in its private
+# repository, fetched for the build with a read-only key (the SOURCE_TOKEN
+# secret: a fine-grained token that can only read Cummmies/Wardrobe's
+# contents). Compiler warnings are kept out of the log, as they quote code.
+#
+# Started by hand, once that version's release exists here:
+#   gh workflow run ios.yml --repo Cummmies/Wardrobe-releases -f tag=v0.3.14
+name: iOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'The version, as its tag (v0.3.14)'
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-${{ inputs.tag }}
+
+jobs:
+  ios:
+    # The iOS 27 SDK (the app's minimum) needs Xcode 27.
+    runs-on: macos-26
+    env:
+      TAG: ${{ inputs.tag }}
+      # Warnings quote the code they're about; this log is public.
+      RUSTFLAGS: -Awarnings
+    steps:
+      - name: The app's code, at that version
+        uses: actions/checkout@v4
+        with:
+          repository: Cummmies/Wardrobe
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - name: Its release is here
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null || {
+            echo "::error::There's no $TAG release in $GITHUB_REPOSITORY yet. Make it first (scripts/release-windows.ps1)."
+            exit 1
+          }
+
+      # The newest Xcode on the runner, betas included: the iOS 27 SDK comes
+      # with Xcode 27, which runners may only have as a beta at first.
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest
+
+      # The app is for iOS 27 and up. If this runner's newest SDK is older,
+      # build for that SDK's version instead (the app still runs on iOS 27).
+      - name: iOS version to build for
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-version)
+          echo "Xcode $(xcodebuild -version | head -1), iPhone SDK $SDK"
+          WANTED=$(node -p 'require("./src-tauri/tauri.conf.json").bundle.iOS.minimumSystemVersion')
+          if [ "${SDK%%.*}" -lt "${WANTED%%.*}" ]; then
+            echo "::warning::This runner's newest iPhone SDK is $SDK, older than iOS $WANTED: building for iOS ${SDK%%.*}.0 and up."
+            node -e '
+              const fs = require("fs"), path = "src-tauri/tauri.conf.json";
+              const conf = JSON.parse(fs.readFileSync(path, "utf8"));
+              conf.bundle.iOS.minimumSystemVersion = process.argv[1];
+              fs.writeFileSync(path, JSON.stringify(conf, null, 2));
+            ' "${SDK%%.*}.0"
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci --no-audit --no-fund
+
+      # The Xcode project is generated, not committed, so it always matches the
+      # Tauri version in package.json.
+      - name: Generate the Xcode project
+        run: |
+          npx tauri ios init --ci
+          cp src-tauri/icons/ios/*.png src-tauri/gen/apple/Assets.xcassets/AppIcon.appiconset/
+          # iPhone and iPad.
+          sed -i '' 's/TARGETED_DEVICE_FAMILY: .*/TARGETED_DEVICE_FAMILY: "1,2"/' src-tauri/gen/apple/project.yml || true
+
+      # No Apple developer account: --no-sign builds an unsigned .ipa, and the
+      # sideloading app signs it when it installs it.
+      - name: Build
+        env:
+          XCODE_XCCONFIG_FILE: ${{ github.workspace }}/unsigned.xcconfig
+        run: |
+          cat > unsigned.xcconfig <<'CONFIG'
+          CODE_SIGNING_ALLOWED = NO
+          CODE_SIGNING_REQUIRED = NO
+          CODE_SIGN_IDENTITY =
+          CODE_SIGN_ENTITLEMENTS =
+          DEVELOPMENT_TEAM =
+          CONFIG
+          npx tauri ios build --target aarch64 --no-sign --ci
+
+      - name: Package the .ipa
+        run: |
+          IPA=$(find src-tauri/gen/apple/build -maxdepth 3 -name '*.ipa' | head -1)
+          if [ -z "$IPA" ]; then
+            echo "::error::No .ipa was built. See the Build step's log."
+            exit 1
+          fi
+          rm -rf ipa && mkdir ipa && unzip -q "$IPA" -d ipa
+          APP=$(ls -d ipa/Payload/*.app | head -1)
+          # --no-sign leaves no signature section at all, which some re-signers
+          # can't handle; an ad-hoc signature adds one, replaced on install.
+          if [ -d "$APP/Frameworks" ]; then
+            find "$APP/Frameworks" \( -name '*.framework' -o -name '*.dylib' \) -maxdepth 1 \
+              -exec codesign --force --sign - --timestamp=none {} \;
+          fi
+          # Sideloaders read the app's entitlements when they re-sign it, and
+          # an app with none at all fails there ("isn't in the correct format").
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")
+          cat > entitlements.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>application-identifier</key>
+            <string>XXXXXXXXXX.$BUNDLE_ID</string>
+            <key>get-task-allow</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+          sed -i '' 's/^          //' entitlements.plist
+          plutil -lint entitlements.plist
+          codesign --force --sign - --timestamp=none --entitlements entitlements.plist "$APP"
+          codesign --verify --deep --strict "$APP"
+          (cd ipa && zip -qry ../Wardrobe.ipa Payload)
+          ls -lh Wardrobe.ipa
+
+      # Beside the Windows installers in this version's release, with the
+      # SideStore source for it: SideStore reads
+      # releases/latest/download/source.json, so it offers this version.
+      - name: Add the .ipa to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NAME="Wardrobe_${TAG#v}_iOS.ipa"
+          cp Wardrobe.ipa "$NAME"
+          gh release upload "$TAG" "$NAME" --repo "$GITHUB_REPOSITORY" --clobber
+          jq -n \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg version "${TAG#v}" \
+            --arg url "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$NAME" \
+            --argjson size "$(stat -f%z "$NAME")" \
+            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg minos "$(node -p 'require("./src-tauri/tauri.conf.json").bundle.iOS.minimumSystemVersion')" \
+            -f .github/sidestore-source.jq > source.json
+          gh release upload "$TAG" source.json --repo "$GITHUB_REPOSITORY" --clobber
+          echo "Added $NAME and source.json to $TAG."
